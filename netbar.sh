@@ -44,7 +44,7 @@ let dateFormatter: DateFormatter = {
 let stateURL = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent("Library/Application Support/NetBar/usage.json")
 let appStateURL = FileManager.default.homeDirectoryForCurrentUser
-    .appendingPathComponent("Library/Application Support/NetBar/app-usage.json")
+    .appendingPathComponent("Library/Application Support/NetBar/app-usage-v3.json")
 
 func run(_ command: String, _ args: [String]) -> String {
     let p = Process()
@@ -146,7 +146,8 @@ func csvFields(_ line: String) -> [String] {
 func nettopSnapshot() -> [String: UInt64]? {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/usr/bin/nettop")
-    process.arguments = ["-P", "-L", "1", "-n", "-x", "-J", "bytes_in,bytes_out"]
+    // The first sample is the baseline; the second reports only the interval delta.
+    process.arguments = ["-P", "-L", "2", "-d", "-s", "1", "-n", "-x", "-J", "bytes_in,bytes_out"]
     let output = Pipe()
     process.standardOutput = output
     process.standardError = FileHandle.nullDevice
@@ -158,7 +159,7 @@ func nettopSnapshot() -> [String: UInt64]? {
               let text = String(data: data, encoding: .utf8) else { return nil }
 
         let lines = text.split(whereSeparator: \.isNewline).map(String.init)
-        guard let headerIndex = lines.firstIndex(where: { $0.contains("bytes_in") && $0.contains("bytes_out") }) else { return nil }
+        guard let headerIndex = lines.lastIndex(where: { $0.contains("bytes_in") && $0.contains("bytes_out") }) else { return nil }
         let header = csvFields(lines[headerIndex])
         guard let inIndex = header.firstIndex(of: "bytes_in"),
               let outIndex = header.firstIndex(of: "bytes_out") else { return nil }
@@ -171,7 +172,10 @@ func nettopSnapshot() -> [String: UInt64]? {
                   let outgoing = UInt64(row[outIndex].trimmingCharacters(in: .whitespaces)) else { continue }
             let rawName = row[processIndex].trimmingCharacters(in: .whitespaces)
             guard let pidSuffix = rawName.range(of: "\\.\\d+$", options: .regularExpression) else { continue }
-            let name = String(rawName[..<pidSuffix.lowerBound]).trimmingCharacters(in: .whitespaces)
+            var name = String(rawName[..<pidSuffix.lowerBound]).trimmingCharacters(in: .whitespaces)
+            if name.hasPrefix("com.apple.WebKit") {
+                name = "WebKit helper (Safari and other apps)"
+            }
             guard !name.isEmpty else { continue }
             totals[name, default: 0] += incoming + outgoing
         }
@@ -183,23 +187,30 @@ let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 let status = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 let menu = NSMenu()
-let heading = NSMenuItem(title: "Network usage", action: nil, keyEquivalent: "")
-heading.isEnabled = false
-menu.addItem(heading)
-menu.addItem(NSMenuItem.separator())
+var menuIsOpen = false
+var todayExpanded = false
+var weekExpanded = false
+final class MenuTrackingDelegate: NSObject, NSMenuDelegate {
+    func menuWillOpen(_ menu: NSMenu) { menuIsOpen = true }
+    func menuDidClose(_ menu: NSMenu) {
+        menuIsOpen = false
+        rebuildAppUsageMenus(for: dateFormatter.string(from: Date()))
+    }
+}
+final class MenuActions: NSObject {
+    @objc func toggleToday(_ sender: NSMenuItem) { todayExpanded.toggle() }
+    @objc func toggleWeek(_ sender: NSMenuItem) { weekExpanded.toggle() }
+}
+let menuTrackingDelegate = MenuTrackingDelegate()
+let menuActions = MenuActions()
+menu.delegate = menuTrackingDelegate
 let todayItem = NSMenuItem(title: "Today: measuring…", action: nil, keyEquivalent: "")
-let appUsageMenu = NSMenu()
-todayItem.submenu = appUsageMenu
-menu.addItem(todayItem)
+todayItem.target = menuActions
+todayItem.action = #selector(MenuActions.toggleToday(_:))
 let weekItem = NSMenuItem(title: "Last 7 days: measuring…", action: nil, keyEquivalent: "")
-let weekAppUsageMenu = NSMenu()
-weekItem.submenu = weekAppUsageMenu
-menu.addItem(weekItem)
-let detailItem = NSMenuItem(title: "↓ Download  —    ↑ Upload  —", action: nil, keyEquivalent: "")
-detailItem.isEnabled = false
-menu.addItem(detailItem)
-menu.addItem(NSMenuItem.separator())
-menu.addItem(NSMenuItem(title: "Quit NetBar", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+weekItem.target = menuActions
+weekItem.action = #selector(MenuActions.toggleWeek(_:))
+let quitItem = NSMenuItem(title: "Quit NetBar", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
 status.menu = menu
 
 var saved = loadState()
@@ -210,41 +221,54 @@ var appUsage = loadAppUsage()
 var appSampleInFlight = false
 var appUsageUnavailable = false
 
-func fillAppUsageMenu(_ targetMenu: NSMenu, apps: [String: UInt64], noteText: String) {
-    targetMenu.removeAllItems()
-    let note = NSMenuItem(title: noteText, action: nil, keyEquivalent: "")
-    note.isEnabled = false
-    targetMenu.addItem(note)
+func appendAppUsageRows(_ apps: [String: UInt64], title: String) {
+    let section = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+    section.isEnabled = false
+    menu.addItem(section)
     let total = apps.values.reduce(UInt64(0), +)
     let totalItem = NSMenuItem(title: "All recorded apps: \(human(Double(total)))", action: nil, keyEquivalent: "")
     totalItem.isEnabled = false
-    targetMenu.addItem(totalItem)
-    targetMenu.addItem(NSMenuItem.separator())
+    menu.addItem(totalItem)
     let sortedApps = apps.sorted { $0.value > $1.value }
     if sortedApps.isEmpty {
         let message = appUsageUnavailable ? "Per-app data unavailable" : "Collecting app usage…"
         let empty = NSMenuItem(title: message, action: nil, keyEquivalent: "")
         empty.isEnabled = false
-        targetMenu.addItem(empty)
+        menu.addItem(empty)
         return
     }
     for (name, bytes) in sortedApps {
         let item = NSMenuItem(title: "\(name): \(human(Double(bytes)))", action: nil, keyEquivalent: "")
         item.isEnabled = false
-        targetMenu.addItem(item)
+        menu.addItem(item)
     }
 }
 
 func rebuildAppUsageMenus(for today: String) {
+    guard !menuIsOpen else { return }
     let todayApps = appUsage.days[today, default: [:]]
-    fillAppUsageMenu(appUsageMenu, apps: todayApps, noteText: "Cumulative app usage · today")
 
     let cutoff = dateFormatter.string(from: calendar.date(byAdding: .day, value: -6, to: Date()) ?? Date())
     var weekApps: [String: UInt64] = [:]
     for (day, apps) in appUsage.days where day >= cutoff && day <= today {
         for (name, bytes) in apps { weekApps[name, default: 0] += bytes }
     }
-    fillAppUsageMenu(weekAppUsageMenu, apps: weekApps, noteText: "Cumulative app usage · last 7 days")
+
+    menu.removeAllItems()
+    todayItem.title = "Today: \(human(Double(saved?.days[today, default: 0] ?? 0))) \(todayExpanded ? "⌄" : "›")"
+    menu.addItem(todayItem)
+    if todayExpanded {
+        appendAppUsageRows(todayApps, title: "Today's app usage · cumulative")
+    }
+    menu.addItem(NSMenuItem.separator())
+    let deviceWeek = saved?.days.filter { $0.key >= cutoff }.values.reduce(UInt64(0), +) ?? 0
+    weekItem.title = "Last 7 days: \(human(Double(deviceWeek))) \(weekExpanded ? "⌄" : "›")"
+    menu.addItem(weekItem)
+    if weekExpanded {
+        appendAppUsageRows(weekApps, title: "Last 7 days by app · cumulative")
+    }
+    menu.addItem(NSMenuItem.separator())
+    menu.addItem(quitItem)
 }
 
 func samplePerAppUsage() {
@@ -314,10 +338,8 @@ func refresh() {
     saveState(saved!)
 
     status.button?.title = "↓ \(human(previousRxSpeed, perSecond: true))  ↑ \(human(previousTxSpeed, perSecond: true))"
-    todayItem.title = "Today: \(human(Double(day)))"
-    weekItem.title = "Last 7 days: \(human(Double(week)))"
-    detailItem.title = "↓ \(human(previousRxSpeed, perSecond: true))    ↑ \(human(previousTxSpeed, perSecond: true))"
-    heading.title = "Network usage · \(iface)"
+    todayItem.title = "Today: \(human(Double(day))) \(todayExpanded ? "⌄" : "›")"
+    weekItem.title = "Last 7 days: \(human(Double(week))) \(weekExpanded ? "⌄" : "›")"
 }
 
 refresh()
